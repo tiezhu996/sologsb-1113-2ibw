@@ -19,6 +19,7 @@ import { useNightStore } from './stores/nightStore';
 import { useSessionStore } from './stores/sessionStore';
 import { useTargetStore } from './stores/targetStore';
 import { useEquipmentStore } from './stores/equipmentStore';
+import { DUTY_ROLE_LABEL } from './types';
 
 const DRAWER_WIDTH = 224;
 
@@ -27,6 +28,7 @@ const NAV_ITEMS = [
   { path: '/targets', label: '观测目标库' },
   { path: '/sessions', label: '排程段与冲突' },
   { path: '/equipment', label: '设备分配视图' },
+  { path: '/sync', label: '值班同步与合并' },
   { path: '/export', label: '导出观测清单' },
 ];
 
@@ -40,6 +42,9 @@ export default function App() {
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
+  const role = useSessionStore((s) => s.role);
+  const online = useSessionStore((s) => s.online);
+  const pendingConflicts = useSessionStore((s) => s.sessions.filter((session) => session.pendingConflict).length);
   const [toast, setToast] = useState(false);
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
@@ -47,7 +52,7 @@ export default function App() {
   const quickExport = () => {
     const text = buildNightPlanText({
       night,
-      sessions: sessions.filter((session) => session.nightId === night?.id),
+      sessions: sessions.filter((session) => session.nightId === night?.id && !session.pendingConflict),
       targets,
       telescopes,
       instruments,
@@ -64,7 +69,37 @@ export default function App() {
           <Typography variant="h6" sx={{ flexGrow: 1, fontSize: 17 }}>
             天文观测计划编排台
           </Typography>
-          <Chip size="small" sx={{ mr: 1.5, color: '#fff', borderColor: 'rgba(255,255,255,.6)' }} variant="outlined" label={night ? `当前观测夜 ${night.date}` : '未选择观测夜'} />
+          <Chip size="small" sx={{ mr: 1, color: '#fff', borderColor: 'rgba(255,255,255,.6)' }} variant="outlined" label={night ? `当前观测夜 ${night.date}` : '未选择观测夜'} />
+          <Chip
+            size="small"
+            sx={{ mr: 1, color: '#fff', borderColor: 'rgba(255,255,255,.6)' }}
+            variant="outlined"
+            component={RouterLink}
+            to="/sync"
+            clickable
+            label={DUTY_ROLE_LABEL[role]}
+          />
+          <Chip
+            size="small"
+            sx={{ mr: 1.5, color: '#fff', borderColor: online ? 'rgba(129,199,132,.9)' : 'rgba(255,183,77,.9)' }}
+            variant="outlined"
+            color={online ? 'success' : 'warning'}
+            component={RouterLink}
+            to="/sync"
+            clickable
+            label={online ? '网络正常' : '网络不稳/离线'}
+          />
+          {pendingConflicts > 0 ? (
+            <Chip
+              size="small"
+              color="error"
+              sx={{ mr: 1.5 }}
+              component={RouterLink}
+              to="/sync"
+              clickable
+              label={`${pendingConflicts} 段待处置`}
+            />
+          ) : null}
           <Button color="inherit" onClick={quickExport}>
             快捷导出
           </Button>

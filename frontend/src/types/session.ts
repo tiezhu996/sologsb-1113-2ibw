@@ -1,6 +1,21 @@
 /** 排程段状态 */
 export type SessionStatus = '待执行' | '进行中' | '已完成' | '因云取消';
 
+/** 排程段表单输入（计划字段 + 状态 + 改期信息） */
+export interface SessionInput {
+  nightId: string;
+  targetId: string;
+  startTime: string;
+  endTime: string;
+  telescopeId: string;
+  instrumentId: string;
+  filterSlot: string;
+  plannedFrames: number;
+  status: SessionStatus;
+  rescheduleReason?: string;
+  backupNightId?: string;
+}
+
 /** 观测排程段 */
 export interface ObsSession {
   id: string;
@@ -26,6 +41,20 @@ export interface ObsSession {
   rescheduleReason?: string;
   /** 替补夜 ID（迁移时补齐） */
   backupNightId?: string;
+  /** 实际帧数（现场执行登记） */
+  actualFrames?: number;
+  /** 实际开始时刻 HH:mm（现场执行登记） */
+  actualStartTime?: string;
+  /** 实际结束时刻 HH:mm（现场执行登记） */
+  actualEndTime?: string;
+  /** 执行人（现场执行登记） */
+  executedBy?: string;
+  /** 执行备注（现场执行登记） */
+  executionNote?: string;
+  /** 执行事实登记时间 ISO */
+  executedAt?: string;
+  /** 登记执行事实的值班窗口 */
+  factRole?: 'main' | 'field';
   /** 数据结构版本 */
   schemaVersion: number;
 }

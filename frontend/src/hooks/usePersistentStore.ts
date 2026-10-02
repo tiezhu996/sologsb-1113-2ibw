@@ -1,16 +1,24 @@
 import Dexie, { type Table } from 'dexie';
 import { useEffect, useState } from 'react';
-import type { Instrument, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
+import type { DutyRole, Instrument, ObsNight, ObsSession, ObsTarget, SessionReplicas, Telescope } from '../types';
+import { SCHEMA_VERSION } from './schemaVersion';
 
 /** IndexedDB 库名（浏览器本地存储，无后端） */
 export const DB_NAME = 'gbobsplan-db';
 
-/** 当前数据结构版本，写入每条记录并用于升级迁移判定 */
-export const SCHEMA_VERSION = 2;
+/** 同步相关 meta 键 */
+export const META_KEYS = {
+  seeded: 'seeded',
+  role: 'sync.role',
+  online: 'sync.online',
+  tombstones: 'sync.tombstones',
+  lastMergedAt: 'sync.lastMergedAt',
+} as const;
 
 class ObsPlanDB extends Dexie {
   targets!: Table<ObsTarget, string>;
   sessions!: Table<ObsSession, string>;
+  sessionReplicas!: Table<SessionReplicas, string>;
   telescopes!: Table<Telescope, string>;
   instruments!: Table<Instrument, string>;
   nights!: Table<ObsNight, string>;
@@ -55,12 +63,35 @@ class ObsPlanDB extends Dexie {
             }
           });
       });
+
+    // v3：主控/现场双窗口离线协同。排程段改为 base/main/field 三副本表；
+    // 旧 sessions 数据按「历史计划」三份同源迁移（base=main=field），不产生新冲突。
+    this.version(3)
+      .stores({
+        targets: 'id, name, catalog, type, priority, magnitude',
+        sessions: null,
+        sessionReplicas: 'id',
+        telescopes: 'id, code, status',
+        instruments: 'id, model, telescopeCode, terminalType',
+        nights: 'id, date, siteName, primary, backup',
+        meta: 'key',
+      })
+      .upgrade(async (tx) => {
+        const legacy = (await tx.table('sessions').toArray()) as ObsSession[];
+        if (legacy.length > 0) {
+          const replicas: SessionReplicas[] = legacy.map((session) => {
+            const row: ObsSession = { ...session, schemaVersion: SCHEMA_VERSION };
+            return { id: row.id, base: row, main: { ...row }, field: { ...row } };
+          });
+          await tx.table('sessionReplicas').bulkPut(replicas);
+        }
+      });
   }
 }
 
 export const db = new ObsPlanDB();
 
-export type TableName = 'targets' | 'sessions' | 'telescopes' | 'instruments' | 'nights';
+export type TableName = 'targets' | 'telescopes' | 'instruments' | 'nights';
 
 /** 写入单条记录（Dexie 读写封装，store 的增删改统一走这里） */
 export async function persistRow(table: TableName, row: unknown): Promise<void> {
@@ -136,24 +167,28 @@ const SEED_SESSIONS: ObsSession[] = [
 
 /** 首次打开（表内无数据）时写入示例数据 */
 export async function seedIfEmpty(): Promise<void> {
-  const flag = await db.meta.get('seeded');
+  const flag = await db.meta.get(META_KEYS.seeded);
   if (flag) return;
   const [targetCount, sessionCount, telescopeCount, instrumentCount, nightCount] = await Promise.all([
     db.targets.count(),
-    db.sessions.count(),
+    db.sessionReplicas.count(),
     db.telescopes.count(),
     db.instruments.count(),
     db.nights.count(),
   ]);
   // Dexie 的 transaction 最多接受 5 张表 + 作用域，因此 meta 标记在事务外写入
-  await db.transaction('rw', db.targets, db.sessions, db.telescopes, db.instruments, db.nights, async () => {
+  await db.transaction('rw', db.targets, db.sessionReplicas, db.telescopes, db.instruments, db.nights, async () => {
     if (targetCount === 0) await db.targets.bulkPut(SEED_TARGETS);
     if (nightCount === 0) await db.nights.bulkPut(SEED_NIGHTS);
     if (telescopeCount === 0) await db.telescopes.bulkPut(SEED_TELESCOPES);
     if (instrumentCount === 0) await db.instruments.bulkPut(SEED_INSTRUMENTS);
-    if (sessionCount === 0) await db.sessions.bulkPut(SEED_SESSIONS);
+    if (sessionCount === 0) {
+      await db.sessionReplicas.bulkPut(
+        SEED_SESSIONS.map((session) => ({ id: session.id, base: session, main: { ...session }, field: { ...session } })),
+      );
+    }
   });
-  await db.meta.put({ key: 'seeded', value: new Date().toISOString() });
+  await db.meta.put({ key: META_KEYS.seeded, value: new Date().toISOString() });
 }
 
 /** 把 Dexie 数据同步到各 Zustand store（动态 import 规避模块循环依赖） */

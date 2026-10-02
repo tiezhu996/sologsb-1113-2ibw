@@ -29,7 +29,7 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
+import { DUTY_ROLE_LABEL, FACT_STATUSES, SYNC_STATE_LABEL, FILTER_NAMES, SESSION_STATUSES, type SessionStatus, type SyncSession } from '../types';
 import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
 
 interface SessionFormState {
@@ -53,6 +53,9 @@ export default function SessionsPage() {
   const updateSession = useSessionStore((s) => s.updateSession);
   const removeSession = useSessionStore((s) => s.removeSession);
   const rescheduleToBackup = useSessionStore((s) => s.rescheduleToBackup);
+  const recordFact = useSessionStore((s) => s.recordFact);
+  const role = useSessionStore((s) => s.role);
+  const online = useSessionStore((s) => s.online);
   const nights = useNightStore((s) => s.nights);
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
@@ -74,6 +77,9 @@ export default function SessionsPage() {
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
   const [rescheduleNight, setRescheduleNight] = useState('');
   const [rescheduleReason, setRescheduleReason] = useState('');
+  const [factOpen, setFactOpen] = useState(false);
+  const [factId, setFactId] = useState('');
+  const [factForm, setFactForm] = useState({ status: '进行中' as SessionStatus, actualFrames: 0, actualStartTime: '', actualEndTime: '', executedBy: '', executionNote: '' });
   const [form, setForm] = useState<SessionFormState>({
     nightId: '',
     targetId: '',
@@ -141,6 +147,10 @@ export default function SessionsPage() {
   function openEdit(id: string) {
     const session = sessions.find((item) => item.id === id);
     if (!session) return;
+    if (session.pendingConflict) {
+      setError('该排程段两边草案冲突待处置，请先到「值班同步与合并」页处置');
+      return;
+    }
     setEditingId(id);
     setError('');
     setForm({
@@ -156,6 +166,36 @@ export default function SessionsPage() {
       rescheduleReason: session.rescheduleReason ?? '',
     });
     setDialogOpen(true);
+  }
+
+  function openFact(id: string) {
+    const session = sessions.find((item) => item.id === id);
+    if (!session || session.pendingConflict) return;
+    setFactId(id);
+    setFactForm({
+      status: (FACT_STATUSES as readonly SessionStatus[]).includes(session.status) ? session.status : '进行中',
+      actualFrames: session.actualFrames ?? session.plannedFrames,
+      actualStartTime: session.actualStartTime ?? session.startTime,
+      actualEndTime: session.actualEndTime ?? session.endTime,
+      executedBy: session.executedBy ?? '',
+      executionNote: session.executionNote ?? '',
+    });
+    setFactOpen(true);
+  }
+
+  async function submitFact() {
+    await recordFact(factId, factForm);
+    setNotice(`已在${DUTY_ROLE_LABEL[role]}登记执行事实（${factForm.status}），合并时不会被排程草案覆盖`);
+    setFactOpen(false);
+  }
+
+  async function handleRemove(id: string) {
+    const result = await removeSession(id);
+    if (!result.ok) {
+      setError(result.reason ?? '删除被拒绝');
+    } else {
+      setNotice('已删除排程段');
+    }
   }
 
   async function submit() {
@@ -208,6 +248,12 @@ export default function SessionsPage() {
         </Alert>
       ) : null}
 
+      <Alert severity={online ? 'success' : 'warning'} sx={{ mb: 2 }}>
+        当前为<strong>{DUTY_ROLE_LABEL[role]}</strong>
+        {online ? '，网络正常，改动将在合并时与对侧比对' : '，网络不稳/离线：改动只写入本窗口草案，恢复后到「值班同步与合并」页合并'}
+        ；已完成 / 进行中的执行事实不会被排程草案覆盖。
+      </Alert>
+
       {highlightId ? (
         <Alert severity="info" sx={{ mb: 2 }}>
           已从设备分配视图定位到排程段 <strong>{highlightId}</strong>（对应行已用左侧红条标出）
@@ -259,6 +305,7 @@ export default function SessionsPage() {
               <TableCell>滤镜</TableCell>
               <TableCell align="right">帧数</TableCell>
               <TableCell>状态</TableCell>
+              <TableCell>同步</TableCell>
               <TableCell>冲突</TableCell>
               <TableCell>改期原因</TableCell>
               <TableCell align="right">操作</TableCell>
@@ -283,6 +330,7 @@ export default function SessionsPage() {
                   <TableCell padding="checkbox">
                     <Checkbox
                       size="small"
+                      disabled={session.pendingConflict}
                       checked={selected.includes(session.id)}
                       onChange={(event) =>
                         setSelected((prev) => (event.target.checked ? [...prev, session.id] : prev.filter((id) => id !== session.id)))
@@ -304,6 +352,36 @@ export default function SessionsPage() {
                   <TableCell align="right">{session.plannedFrames}</TableCell>
                   <TableCell>
                     <StatusChip status={session.status} />
+                    {session.actualFrames !== undefined ? (
+                      <Typography variant="caption" display="block" color="text.secondary">
+                        实记 {session.actualFrames} 帧{session.executedBy ? ` · ${session.executedBy}` : ''}
+                      </Typography>
+                    ) : null}
+                  </TableCell>
+                  <TableCell>
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      color={
+                        session.pendingConflict
+                          ? 'error'
+                          : session.syncState === 'fact-locked'
+                            ? 'warning'
+                            : session.syncState === 'local-draft'
+                              ? 'info'
+                              : session.syncState === 'remote-draft'
+                                ? 'success'
+                                : 'default'
+                      }
+                      label={session.pendingConflict ? '待处置冲突' : SYNC_STATE_LABEL[session.syncState]}
+                      component={session.pendingConflict ? Button : 'div'}
+                      onClick={session.pendingConflict ? () => setError('该段等待在「值班同步与合并」页人工处置') : undefined}
+                    />
+                    {session.blockedDraft ? (
+                      <Typography variant="caption" display="block" color="warning.main">
+                        拦截{DUTY_ROLE_LABEL[session.blockedDraft.role]}草案
+                      </Typography>
+                    ) : null}
                   </TableCell>
                   <TableCell>
                     <ConflictBadge conflicts={conflicts} compact />
@@ -321,12 +399,23 @@ export default function SessionsPage() {
                     ) : null}
                   </TableCell>
                   <TableCell align="right">
-                    <Button size="small" onClick={() => openEdit(session.id)}>
-                      编辑
-                    </Button>
-                    <Button size="small" color="error" onClick={() => void removeSession(session.id)}>
-                      删除
-                    </Button>
+                    {session.pendingConflict ? (
+                      <Button size="small" color="error" href="/sync">
+                        去处置
+                      </Button>
+                    ) : (
+                      <>
+                        <Button size="small" onClick={() => openEdit(session.id)}>
+                          编辑草案
+                        </Button>
+                        <Button size="small" color="secondary" onClick={() => openFact(session.id)}>
+                          执行登记
+                        </Button>
+                        <Button size="small" color="error" onClick={() => void handleRemove(session.id)}>
+                          删除
+                        </Button>
+                      </>
+                    )}
                   </TableCell>
                 </TableRow>
               );
@@ -463,6 +552,45 @@ export default function SessionsPage() {
           <Button onClick={() => setRescheduleOpen(false)}>取消</Button>
           <Button variant="contained" color="warning" onClick={() => void submitReschedule()}>
             确认改期
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={factOpen} onClose={() => setFactOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>现场执行登记（{DUTY_ROLE_LABEL[role]}）</DialogTitle>
+        <DialogContent>
+          <Alert severity="info" sx={{ mb: 1.5 }}>
+            执行事实独立于排程草案：只记录实际状态与帧数，不改计划设备/时段；合并时「进行中 / 已完成」事实不会被对侧草案覆盖。
+          </Alert>
+          <FieldRow label="执行状态" required>
+            <TextField select size="small" fullWidth value={factForm.status} onChange={(event) => setFactForm({ ...factForm, status: event.target.value as SessionStatus })}>
+              {(FACT_STATUSES as readonly SessionStatus[]).map((status) => (
+                <MenuItem key={status} value={status}>
+                  {status}
+                </MenuItem>
+              ))}
+            </TextField>
+          </FieldRow>
+          <FieldRow label="实际帧数">
+            <TextField size="small" type="number" fullWidth value={factForm.actualFrames} onChange={(event) => setFactForm({ ...factForm, actualFrames: Number(event.target.value) })} />
+          </FieldRow>
+          <FieldRow label="实际开始">
+            <TextField size="small" fullWidth value={factForm.actualStartTime} onChange={(event) => setFactForm({ ...factForm, actualStartTime: event.target.value })} placeholder="HH:mm" />
+          </FieldRow>
+          <FieldRow label="实际结束">
+            <TextField size="small" fullWidth value={factForm.actualEndTime} onChange={(event) => setFactForm({ ...factForm, actualEndTime: event.target.value })} placeholder="HH:mm" />
+          </FieldRow>
+          <FieldRow label="执行人">
+            <TextField size="small" fullWidth value={factForm.executedBy} onChange={(event) => setFactForm({ ...factForm, executedBy: event.target.value })} />
+          </FieldRow>
+          <FieldRow label="执行备注">
+            <TextField size="small" fullWidth multiline minRows={2} value={factForm.executionNote} onChange={(event) => setFactForm({ ...factForm, executionNote: event.target.value })} />
+          </FieldRow>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setFactOpen(false)}>取消</Button>
+          <Button variant="contained" color="secondary" onClick={() => void submitFact()}>
+            登记执行事实
           </Button>
         </DialogActions>
       </Dialog>

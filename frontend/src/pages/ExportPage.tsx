@@ -35,7 +35,10 @@ export default function ExportPage() {
   const [notice, setNotice] = useState('');
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
-  const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
+  const nightSessionsAll = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
+  /** 导出闸门：未确认处置的冲突排程段不进入导出清单 */
+  const heldBack = useMemo(() => nightSessionsAll.filter((session) => session.pendingConflict), [nightSessionsAll]);
+  const nightSessions = useMemo(() => nightSessionsAll.filter((session) => !session.pendingConflict), [nightSessionsAll]);
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
 
@@ -82,6 +85,17 @@ export default function ExportPage() {
         </Alert>
       ) : null}
 
+      {heldBack.length > 0 ? (
+        <Alert severity="warning" sx={{ mb: 2 }} action={
+          <Button color="inherit" size="small" component="a" href="/sync">
+            去处置
+          </Button>
+        }>
+          本夜有 {heldBack.length} 个排程段两边草案尚未确认处置，已按规则排除在导出清单之外（
+          {heldBack.map((session) => `${session.startTime}-${session.endTime}`).join('、')}）。处置完成后自动纳入。
+        </Alert>
+      ) : null}
+
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center" className="no-print">
         <TextField select size="small" label="观测夜" value={night?.id ?? ''} onChange={(event) => setCurrentNight(event.target.value)} sx={{ minWidth: 260 }}>
           {nights.map((item) => (
@@ -90,7 +104,7 @@ export default function ExportPage() {
             </MenuItem>
           ))}
         </TextField>
-        <Chip size="small" label={`排程段 ${nightSessions.length}`} />
+        <Chip size="small" label={`排程段 ${nightSessions.length}${heldBack.length ? `（另有 ${heldBack.length} 段待处置未纳入）` : ''}`} color={heldBack.length ? 'warning' : 'default'} />
         <Chip size="small" label={`计划帧数合计 ${nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0)}`} />
         <ConflictBadge conflicts={conflicts} />
         <Button
