@@ -14,11 +14,14 @@ import Alert from '@mui/material/Alert';
 import Snackbar from '@mui/material/Snackbar';
 import { Link as RouterLink, Outlet, useLocation } from 'react-router-dom';
 import { buildNightPlanText, downloadText } from './utils/export';
+import { filterExportable } from './utils/merge';
 import { usePersistentStore } from './hooks/usePersistentStore';
 import { useNightStore } from './stores/nightStore';
 import { useSessionStore } from './stores/sessionStore';
+import { useSyncStore } from './stores/syncStore';
 import { useTargetStore } from './stores/targetStore';
 import { useEquipmentStore } from './stores/equipmentStore';
+import { DUTY_ROLE_LABEL } from './types';
 
 const DRAWER_WIDTH = 224;
 
@@ -27,6 +30,7 @@ const NAV_ITEMS = [
   { path: '/targets', label: '观测目标库' },
   { path: '/sessions', label: '排程段与冲突' },
   { path: '/equipment', label: '设备分配视图' },
+  { path: '/sync', label: '值班窗口与合并' },
   { path: '/export', label: '导出观测清单' },
 ];
 
@@ -40,14 +44,21 @@ export default function App() {
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
+  const role = useSyncStore((s) => s.role);
+  const online = useSyncStore((s) => s.online);
+  const conflicts = useSyncStore((s) => s.conflicts);
+  const offlineChanges = useSyncStore((s) => s.offlineChanges);
   const [toast, setToast] = useState(false);
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
+  const pendingCount = conflicts.filter((conflict) => conflict.status === 'pending').length;
 
   const quickExport = () => {
+    // 未确认处置的冲突段不能进入导出清单
+    const exportable = filterExportable(sessions, conflicts).filter((session) => session.nightId === night?.id);
     const text = buildNightPlanText({
       night,
-      sessions: sessions.filter((session) => session.nightId === night?.id),
+      sessions: exportable,
       targets,
       telescopes,
       instruments,
@@ -64,6 +75,29 @@ export default function App() {
           <Typography variant="h6" sx={{ flexGrow: 1, fontSize: 17 }}>
             天文观测计划编排台
           </Typography>
+          <Chip
+            size="small"
+            sx={{ mr: 1, color: '#fff', borderColor: role === 'master' ? 'rgba(120,170,255,.8)' : 'rgba(120,220,160,.8)' }}
+            variant="outlined"
+            color={role === 'master' ? 'info' : 'success'}
+            label={DUTY_ROLE_LABEL[role]}
+            component={RouterLink}
+            to="/sync"
+            clickable
+          />
+          <Chip
+            size="small"
+            sx={{ mr: 1.5, color: '#fff' }}
+            variant="outlined"
+            color={online ? 'success' : 'warning'}
+            label={online ? '网络在线' : `离线 · 草案 ${offlineChanges.filter((change) => change.side === role).length}`}
+            component={RouterLink}
+            to="/sync"
+            clickable
+          />
+          {pendingCount > 0 ? (
+            <Chip size="small" color="error" sx={{ mr: 1.5 }} label={`${pendingCount} 段冲突待处置`} component={RouterLink} to="/sync" clickable />
+          ) : null}
           <Chip size="small" sx={{ mr: 1.5, color: '#fff', borderColor: 'rgba(255,255,255,.6)' }} variant="outlined" label={night ? `当前观测夜 ${night.date}` : '未选择观测夜'} />
           <Button color="inherit" onClick={quickExport}>
             快捷导出

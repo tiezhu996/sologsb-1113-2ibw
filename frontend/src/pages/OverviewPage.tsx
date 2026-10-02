@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import Alert from '@mui/material/Alert';
 import AlertTitle from '@mui/material/AlertTitle';
 import Box from '@mui/material/Box';
+import Button from '@mui/material/Button';
 import Card from '@mui/material/Card';
 import CardContent from '@mui/material/CardContent';
 import MenuItem from '@mui/material/MenuItem';
@@ -16,9 +17,10 @@ import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
 import { useNightStore } from '../stores/nightStore';
 import { useSessionStore } from '../stores/sessionStore';
+import { useSyncStore } from '../stores/syncStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
+import { DUTY_ROLE_LABEL, NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
 import { altitudeAt, axisMinutes, isBelowThreshold, minutesToTime, moonBrightnessFactor, moonConflict, moonPhaseText, timelineTicks } from '../utils/astro';
 
 /** 本夜编排总览：30 分钟刻度时间轴 + 月相与月出月落条带 + 冲突与标灰提示 */
@@ -31,6 +33,9 @@ export default function OverviewPage() {
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
+  const role = useSyncStore((s) => s.role);
+  const online = useSyncStore((s) => s.online);
+  const pendingCount = useSyncStore((s) => s.conflicts.filter((c) => c.status === 'pending').length);
   const { conflictIds, conflictsOfNight } = useConflictCheck();
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
@@ -105,6 +110,13 @@ export default function OverviewPage() {
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
         按 30 分钟刻度展示时间轴与已排程段，月相与月出月落条带悬浮于时间轴上方；低于最小地平高度阈值的目标自动标灰。
       </Typography>
+
+      {!online || pendingCount > 0 ? (
+        <Alert severity={pendingCount > 0 ? 'error' : 'warning'} sx={{ mb: 2 }} action={<Button color="inherit" size="small" href="/sync">前往值班窗口与合并</Button>}>
+          {!online ? `当前为${DUTY_ROLE_LABEL[role]}离线状态，修改只保存在本侧草案，网络恢复后合并。` : ''}
+          {pendingCount > 0 ? ` 有 ${pendingCount} 个排程段两边都改过、等待人工处置，处置前不会进入导出清单。` : ''}
+        </Alert>
+      ) : null}
 
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
         <TextField select size="small" label="观测夜" value={night.id} onChange={(event) => setCurrentNight(event.target.value)} sx={{ minWidth: 260 }}>

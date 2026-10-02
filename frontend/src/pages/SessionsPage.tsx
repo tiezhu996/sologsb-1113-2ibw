@@ -25,11 +25,12 @@ import ConflictBadge from '../components/common/ConflictBadge';
 import FieldRow from '../components/common/FieldRow';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
-import { useSessionStore } from '../stores/sessionStore';
+import { ConflictLockedError, FactProtectedError, useSessionStore } from '../stores/sessionStore';
+import { useSyncStore } from '../stores/syncStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
+import { DUTY_ROLE_LABEL, FIELD_STATUSES, FILTER_NAMES, PROVENANCE_COLOR, SESSION_STATUSES, isExecutionFact, type SessionStatus } from '../types';
 import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
 
 interface SessionFormState {
@@ -45,6 +46,15 @@ interface SessionFormState {
   rescheduleReason: string;
 }
 
+interface ExecutionFormState {
+  status: SessionStatus;
+  actualStartTime: string;
+  actualEndTime: string;
+  actualFrames: number | '';
+  executionNote: string;
+  recordedBy: string;
+}
+
 /** 排程段列表与冲突检测结果，支持批量改期到备用观测夜 */
 export default function SessionsPage() {
   usePersistentStore();
@@ -53,11 +63,22 @@ export default function SessionsPage() {
   const updateSession = useSessionStore((s) => s.updateSession);
   const removeSession = useSessionStore((s) => s.removeSession);
   const rescheduleToBackup = useSessionStore((s) => s.rescheduleToBackup);
+  const recordExecution = useSessionStore((s) => s.recordExecution);
+  const role = useSyncStore((s) => s.role);
+  const online = useSyncStore((s) => s.online);
+  const mergeConflicts = useSyncStore((s) => s.conflicts);
   const nights = useNightStore((s) => s.nights);
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
   const { findConflicts, conflictIds } = useConflictCheck();
+
+  /** 待人工处置的冲突段：锁定编辑 / 删除 / 改期 / 执行登记 */
+  const pendingIds = useMemo(
+    () => new Set(mergeConflicts.filter((conflict) => conflict.status === 'pending').map((conflict) => conflict.sessionId)),
+    [mergeConflicts],
+  );
+  const isField = role === 'field';
 
   /** 支持从设备分配视图一键跳转：?night=<夜ID>&highlight=<排程段ID> */
   const [searchParams] = useSearchParams();
@@ -74,6 +95,16 @@ export default function SessionsPage() {
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
   const [rescheduleNight, setRescheduleNight] = useState('');
   const [rescheduleReason, setRescheduleReason] = useState('');
+  const [execOpen, setExecOpen] = useState(false);
+  const [execId, setExecId] = useState('');
+  const [execForm, setExecForm] = useState<ExecutionFormState>({
+    status: '进行中',
+    actualStartTime: '',
+    actualEndTime: '',
+    actualFrames: '',
+    executionNote: '',
+    recordedBy: '',
+  });
   const [form, setForm] = useState<SessionFormState>({
     nightId: '',
     targetId: '',
@@ -132,7 +163,8 @@ export default function SessionsPage() {
       instrumentId: instrument?.id ?? '',
       filterSlot: 'L',
       plannedFrames: 30,
-      status: '待执行',
+      // 主控离线只能排未开始段；现场可以直接登记一条执行中的记录
+      status: isField ? '进行中' : '待执行',
       rescheduleReason: '',
     });
     setDialogOpen(true);
@@ -158,6 +190,22 @@ export default function SessionsPage() {
     setDialogOpen(true);
   }
 
+  function openExec(id: string) {
+    const session = sessions.find((item) => item.id === id);
+    if (!session) return;
+    setExecId(id);
+    setError('');
+    setExecForm({
+      status: isExecutionFact(session.status) ? session.status : '进行中',
+      actualStartTime: session.actualStartTime ?? session.startTime,
+      actualEndTime: session.actualEndTime ?? '',
+      actualFrames: session.actualFrames ?? '',
+      executionNote: session.executionNote ?? '',
+      recordedBy: session.recordedBy ?? '',
+    });
+    setExecOpen(true);
+  }
+
   async function submit() {
     if (!form.nightId || !form.targetId || !form.telescopeId) {
       setError('观测夜、目标与望远镜均为必填');
@@ -171,14 +219,45 @@ export default function SessionsPage() {
       setError('该望远镜在所选时段已有排程，请调整时段或改期到备用观测夜');
       return;
     }
-    if (editingId) {
-      await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已更新排程段');
-    } else {
-      await addSession({ ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已新增排程段');
+    try {
+      if (editingId) {
+        await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
+        setNotice(online ? '已更新排程段' : `已保存为${DUTY_ROLE_LABEL[role]}离线草案，网络恢复后合并`);
+      } else {
+        await addSession({ ...form, rescheduleReason: form.rescheduleReason });
+        setNotice(online ? '已新增排程段' : `已离线记录到${DUTY_ROLE_LABEL[role]}侧，网络恢复后合并`);
+      }
+      setDialogOpen(false);
+    } catch (reason) {
+      setError(reason instanceof FactProtectedError || reason instanceof ConflictLockedError ? reason.message : '保存失败，请重试');
     }
-    setDialogOpen(false);
+  }
+
+  async function submitExec() {
+    if (!execId) return;
+    try {
+      await recordExecution(execId, {
+        status: execForm.status,
+        actualStartTime: execForm.actualStartTime,
+        actualEndTime: execForm.actualEndTime,
+        actualFrames: execForm.actualFrames === '' ? undefined : Number(execForm.actualFrames),
+        executionNote: execForm.executionNote,
+        recordedBy: execForm.recordedBy,
+      });
+      setNotice(online ? '已登记现场执行记录' : '现场执行记录已离线保存，网络恢复后优先合并');
+      setExecOpen(false);
+    } catch (reason) {
+      setError(reason instanceof FactProtectedError || reason instanceof ConflictLockedError ? reason.message : '登记失败，请重试');
+    }
+  }
+
+  async function removeById(id: string) {
+    try {
+      await removeSession(id);
+      setNotice(online ? '已删除排程段' : '已记录为离线删除草案，网络恢复后合并');
+    } catch (reason) {
+      setError(reason instanceof FactProtectedError || reason instanceof ConflictLockedError ? reason.message : '删除失败，请重试');
+    }
   }
 
   async function submitReschedule() {
@@ -186,11 +265,15 @@ export default function SessionsPage() {
       setError('请选择备用观测夜');
       return;
     }
-    const count = await rescheduleToBackup(selected, rescheduleNight, rescheduleReason);
-    setNotice(`已将 ${count} 个排程段改期至 ${nightById(rescheduleNight)?.date ?? rescheduleNight}，原因：${rescheduleReason || '未填写'}`);
-    setSelected([]);
-    setRescheduleOpen(false);
-    setRescheduleReason('');
+    try {
+      const count = await rescheduleToBackup(selected, rescheduleNight, rescheduleReason);
+      setNotice(`已将 ${count} 个排程段改期至 ${nightById(rescheduleNight)?.date ?? rescheduleNight}，原因：${rescheduleReason || '未填写'}`);
+      setSelected([]);
+      setRescheduleOpen(false);
+      setRescheduleReason('');
+    } catch (reason) {
+      setError(reason instanceof FactProtectedError || reason instanceof ConflictLockedError ? reason.message : '改期失败，请重试');
+    }
   }
 
   return (
@@ -208,6 +291,13 @@ export default function SessionsPage() {
         </Alert>
       ) : null}
 
+      <Alert severity={online ? 'info' : 'warning'} sx={{ mb: 2 }}>
+        当前为{DUTY_ROLE_LABEL[role]}
+        {online ? '，网络在线：修改直接生效' : '，网络离线：修改只保存在本侧草案，网络恢复后在「值班窗口与合并」页合并'}
+        ；已完成 / 进行中的执行事实不会被主控排程草案覆盖。
+        {pendingIds.size > 0 ? ` 另有 ${pendingIds.size} 个排程段在冲突区等待人工处置，已锁定。` : ''}
+      </Alert>
+
       {highlightId ? (
         <Alert severity="info" sx={{ mb: 2 }}>
           已从设备分配视图定位到排程段 <strong>{highlightId}</strong>（对应行已用左侧红条标出）
@@ -216,9 +306,21 @@ export default function SessionsPage() {
 
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
         <Button variant="contained" onClick={openCreate}>
-          新增排程段
+          {isField ? '现场登记记录' : '新增排程段'}
         </Button>
-        <Button variant="outlined" color="warning" disabled={selected.length === 0} onClick={() => setRescheduleOpen(true)}>
+        <Button
+          variant="outlined"
+          color="warning"
+          disabled={selected.length === 0}
+          onClick={() => {
+            const locked = selected.filter((id) => pendingIds.has(id) || (isField === false && isExecutionFact(sessions.find((s) => s.id === id)?.status ?? '待执行')));
+            if (locked.length > 0) {
+              setError(`选中的 ${locked.join('、')} 为待处置冲突段或执行事实，不能改期`);
+              return;
+            }
+            setRescheduleOpen(true);
+          }}
+        >
           批量改期到备用夜（已选 {selected.length}）
         </Button>
         <TextField select size="small" label="观测夜" value={nightFilter} onChange={(event) => setNightFilter(event.target.value)} sx={{ minWidth: 200 }}>
@@ -260,6 +362,7 @@ export default function SessionsPage() {
               <TableCell align="right">帧数</TableCell>
               <TableCell>状态</TableCell>
               <TableCell>冲突</TableCell>
+              <TableCell>来源 / 执行事实</TableCell>
               <TableCell>改期原因</TableCell>
               <TableCell align="right">操作</TableCell>
             </TableRow>
@@ -273,16 +376,22 @@ export default function SessionsPage() {
                 endTime: session.endTime,
                 ignoreSessionId: session.id,
               });
+              const locked = pendingIds.has(session.id);
+              const masterBlockedFact = !isField && isExecutionFact(session.status);
               return (
                 <TableRow
                   key={session.id}
                   hover
                   selected={selected.includes(session.id)}
-                  sx={session.id === highlightId ? { boxShadow: 'inset 4px 0 0 #d32f2f' } : undefined}
+                  sx={{
+                    ...(session.id === highlightId ? { boxShadow: 'inset 4px 0 0 #d32f2f' } : {}),
+                    ...(locked ? { bgcolor: 'rgba(211,47,47,.07)' } : {}),
+                  }}
                 >
                   <TableCell padding="checkbox">
                     <Checkbox
                       size="small"
+                      disabled={locked || masterBlockedFact}
                       checked={selected.includes(session.id)}
                       onChange={(event) =>
                         setSelected((prev) => (event.target.checked ? [...prev, session.id] : prev.filter((id) => id !== session.id)))
@@ -295,6 +404,9 @@ export default function SessionsPage() {
                     <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
                       {formatMinutes(durationMinutes(session.startTime, session.endTime))}
                     </Typography>
+                    {session.__offlineSide ? (
+                      <Chip size="small" color="warning" variant="outlined" label={`${DUTY_ROLE_LABEL[session.__offlineSide]}离线草案`} sx={{ mt: 0.25 }} />
+                    ) : null}
                   </TableCell>
                   <TableCell>{targetById(session.targetId)?.name ?? '未知目标'}</TableCell>
                   <TableCell>
@@ -309,6 +421,24 @@ export default function SessionsPage() {
                     <ConflictBadge conflicts={conflicts} compact />
                   </TableCell>
                   <TableCell>
+                    <Chip
+                      size="small"
+                      color={PROVENANCE_COLOR[session.provenance ?? '初始计划']}
+                      variant={session.provenance === '初始计划' || session.provenance === '历史迁移' ? 'outlined' : 'filled'}
+                      label={session.provenance ?? '初始计划'}
+                    />
+                    {session.actualFrames !== undefined || session.actualStartTime ? (
+                      <Typography variant="caption" color="success.main" sx={{ display: 'block', mt: 0.25 }}>
+                        {session.actualStartTime ? `实际 ${session.actualStartTime}-${session.actualEndTime ?? '…'} · ` : ''}
+                        {session.actualFrames !== undefined ? `实拍 ${session.actualFrames} 帧` : ''}
+                        {session.executionNote ? `（${session.executionNote}）` : ''}
+                      </Typography>
+                    ) : null}
+                    {locked ? (
+                      <Chip size="small" color="error" sx={{ mt: 0.25 }} label="冲突待处置·锁定" component="a" href="/sync" clickable />
+                    ) : null}
+                  </TableCell>
+                  <TableCell>
                     {session.rescheduleReason ? (
                       <Typography variant="caption">{session.rescheduleReason}</Typography>
                     ) : (
@@ -321,12 +451,25 @@ export default function SessionsPage() {
                     ) : null}
                   </TableCell>
                   <TableCell align="right">
-                    <Button size="small" onClick={() => openEdit(session.id)}>
-                      编辑
-                    </Button>
-                    <Button size="small" color="error" onClick={() => void removeSession(session.id)}>
-                      删除
-                    </Button>
+                    {locked ? (
+                      <Button size="small" color="error" href="/sync">
+                        去处置
+                      </Button>
+                    ) : (
+                      <>
+                        {isField ? (
+                          <Button size="small" color="success" onClick={() => openExec(session.id)}>
+                            记执行
+                          </Button>
+                        ) : null}
+                        <Button size="small" disabled={masterBlockedFact} title={masterBlockedFact ? '执行事实受保护，主控不能改排程' : ''} onClick={() => openEdit(session.id)}>
+                          {isField ? '查看/补录' : '编辑'}
+                        </Button>
+                        <Button size="small" color="error" disabled={masterBlockedFact} title={masterBlockedFact ? '执行事实受保护，主控不能删除' : ''} onClick={() => void removeById(session.id)}>
+                          删除
+                        </Button>
+                      </>
+                    )}
                   </TableCell>
                 </TableRow>
               );
@@ -420,12 +563,23 @@ export default function SessionsPage() {
             <TextField size="small" type="number" fullWidth value={form.plannedFrames} onChange={(event) => setForm({ ...form, plannedFrames: Number(event.target.value) })} />
           </FieldRow>
           <FieldRow label="状态">
-            <TextField select size="small" fullWidth value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as SessionStatus })}>
-              {SESSION_STATUSES.map((status) => (
-                <MenuItem key={status} value={status}>
-                  {status}
-                </MenuItem>
-              ))}
+            <TextField
+              select
+              size="small"
+              fullWidth
+              value={form.status}
+              onChange={(event) => setForm({ ...form, status: event.target.value as SessionStatus })}
+              helperText={isField ? '现场窗口：登记执行状态建议使用「记执行」按钮，可补录实际时刻与帧数' : '主控排程：未开始段保持「待执行」，进行中 / 已完成由现场登记'}
+            >
+              {(isField ? SESSION_STATUSES : SESSION_STATUSES).map((status) => {
+                const masterForbidden = !isField && isExecutionFact(status);
+                return (
+                  <MenuItem key={status} value={status} disabled={masterForbidden}>
+                    {status}
+                    {masterForbidden ? '（现场执行事实，主控不可选）' : ''}
+                  </MenuItem>
+                );
+              })}
             </TextField>
           </FieldRow>
           <FieldRow label="改期原因">
@@ -463,6 +617,53 @@ export default function SessionsPage() {
           <Button onClick={() => setRescheduleOpen(false)}>取消</Button>
           <Button variant="contained" color="warning" onClick={() => void submitReschedule()}>
             确认改期
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 现场执行记录对话框：进行中 / 已完成属于执行事实，网络恢复后优先合并、不被草案覆盖 */}
+      <Dialog open={execOpen} onClose={() => setExecOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>现场执行记录{execId ? ` · ${execId}` : ''}</DialogTitle>
+        <DialogContent>
+          {error ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              {error}
+            </Alert>
+          ) : null}
+          <Alert severity={online ? 'info' : 'warning'} sx={{ mb: 1.5 }}>
+            {online
+              ? '记录直接生效，主控后续的排程草案不能覆盖该执行事实。'
+              : '当前离线：记录先保存在现场侧草案，网络恢复后与主控草案合并；两边都改同一时段会进入冲突区。'}
+          </Alert>
+          <FieldRow label="执行状态" required>
+            <TextField select size="small" fullWidth value={execForm.status} onChange={(event) => setExecForm({ ...execForm, status: event.target.value as SessionStatus })}>
+              {FIELD_STATUSES.map((status) => (
+                <MenuItem key={status} value={status}>
+                  {status}
+                </MenuItem>
+              ))}
+            </TextField>
+          </FieldRow>
+          <FieldRow label="实际开始时刻" hint="HH:mm">
+            <TextField size="small" fullWidth value={execForm.actualStartTime} onChange={(event) => setExecForm({ ...execForm, actualStartTime: event.target.value })} placeholder="20:42" />
+          </FieldRow>
+          <FieldRow label="实际结束时刻" hint="进行中可留空">
+            <TextField size="small" fullWidth value={execForm.actualEndTime} onChange={(event) => setExecForm({ ...execForm, actualEndTime: event.target.value })} placeholder="22:05" />
+          </FieldRow>
+          <FieldRow label="实际帧数">
+            <TextField size="small" type="number" fullWidth value={execForm.actualFrames} onChange={(event) => setExecForm({ ...execForm, actualFrames: event.target.value === '' ? '' : Number(event.target.value) })} />
+          </FieldRow>
+          <FieldRow label="记录人">
+            <TextField size="small" fullWidth value={execForm.recordedBy} onChange={(event) => setExecForm({ ...execForm, recordedBy: event.target.value })} placeholder="现场值班" />
+          </FieldRow>
+          <FieldRow label="现场备注" hint="天气、异常、与计划偏差">
+            <TextField size="small" fullWidth multiline minRows={2} value={execForm.executionNote} onChange={(event) => setExecForm({ ...execForm, executionNote: event.target.value })} />
+          </FieldRow>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setExecOpen(false)}>取消</Button>
+          <Button variant="contained" color="success" onClick={() => void submitExec()}>
+            保存执行记录
           </Button>
         </DialogActions>
       </Dialog>

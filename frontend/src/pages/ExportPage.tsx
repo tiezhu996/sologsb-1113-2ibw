@@ -14,12 +14,14 @@ import StatusChip from '../components/common/StatusChip';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
 import { useSessionStore } from '../stores/sessionStore';
+import { useSyncStore } from '../stores/syncStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
+import { NIGHT_TOTAL_MINUTES, PROVENANCE_COLOR, TARGET_COLOR } from '../types';
 import { axisMinutes, timelineTicks } from '../utils/astro';
 import { buildNightPlanText, buildPlanCsv, downloadText, printPage } from '../utils/export';
+import { filterExportable } from '../utils/merge';
 
 /** 导出当晚观测清单（文本 / CSV / 打印视图） */
 export default function ExportPage() {
@@ -31,26 +33,38 @@ export default function ExportPage() {
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
+  const mergeConflicts = useSyncStore((s) => s.conflicts);
   const { conflictsOfNight, conflictIds } = useConflictCheck();
   const [notice, setNotice] = useState('');
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
   const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
+
+  // 没有确认处置的排程段（两边都改、等待人工处置的冲突段）不能进入导出清单
+  const exportableSessions = useMemo(
+    () => filterExportable(nightSessions, mergeConflicts),
+    [nightSessions, mergeConflicts],
+  );
+  const blockedSessions = useMemo(() => {
+    const allowed = new Set(exportableSessions.map((session) => session.id));
+    return nightSessions.filter((session) => !allowed.has(session.id));
+  }, [nightSessions, exportableSessions]);
+
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
 
   const planText = useMemo(
-    () => buildNightPlanText({ night, sessions: nightSessions, targets, telescopes, instruments }),
-    [night, nightSessions, targets, telescopes, instruments],
+    () => buildNightPlanText({ night, sessions: exportableSessions, targets, telescopes, instruments }),
+    [night, exportableSessions, targets, telescopes, instruments],
   );
   const csv = useMemo(
-    () => buildPlanCsv({ night, sessions: nightSessions, targets, telescopes, instruments }),
-    [night, nightSessions, targets, telescopes, instruments],
+    () => buildPlanCsv({ night, sessions: exportableSessions, targets, telescopes, instruments }),
+    [night, exportableSessions, targets, telescopes, instruments],
   );
 
   const bars: TimelineBar[] = useMemo(
     () =>
-      nightSessions.map((session) => {
+      exportableSessions.map((session) => {
         const target = targets.find((item) => item.id === session.targetId);
         const startMinute = Math.max(0, Math.min(NIGHT_TOTAL_MINUTES, axisMinutes(session.startTime)));
         const rawEnd = axisMinutes(session.endTime);
@@ -64,7 +78,7 @@ export default function ExportPage() {
           tooltip: `${session.startTime}-${session.endTime} · ${session.filterSlot} · ${session.plannedFrames} 帧 · ${session.status}`,
         };
       }),
-    [nightSessions, targets],
+    [exportableSessions, targets],
   );
 
   return (
@@ -82,6 +96,14 @@ export default function ExportPage() {
         </Alert>
       ) : null}
 
+      {blockedSessions.length > 0 ? (
+        <Alert severity="error" sx={{ mb: 2 }} action={<Button color="inherit" size="small" href="/sync">前往冲突区处置</Button>}>
+          有 {blockedSessions.length} 个排程段两边都改过、尚未人工处置，已从导出清单中剔除：
+          {blockedSessions.map((session) => ` ${session.id}`).join('、')}
+          。处置完成前不会进入文本、CSV 与打印视图。
+        </Alert>
+      ) : null}
+
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center" className="no-print">
         <TextField select size="small" label="观测夜" value={night?.id ?? ''} onChange={(event) => setCurrentNight(event.target.value)} sx={{ minWidth: 260 }}>
           {nights.map((item) => (
@@ -90,14 +112,15 @@ export default function ExportPage() {
             </MenuItem>
           ))}
         </TextField>
-        <Chip size="small" label={`排程段 ${nightSessions.length}`} />
-        <Chip size="small" label={`计划帧数合计 ${nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0)}`} />
+        <Chip size="small" label={`可导出 ${exportableSessions.length} / ${nightSessions.length} 段`} color={blockedSessions.length > 0 ? 'warning' : 'default'} />
+        <Chip size="small" label={`计划帧数合计 ${exportableSessions.reduce((sum, session) => sum + session.plannedFrames, 0)}`} />
         <ConflictBadge conflicts={conflicts} />
         <Button
           variant="contained"
+          disabled={blockedSessions.length > 0}
           onClick={() => {
             downloadText(`观测清单-${night?.date ?? 'night'}.txt`, planText);
-            setNotice('已下载观测清单文本文件');
+            setNotice('已下载观测清单文本文件（已排除未处置冲突段）');
           }}
         >
           下载文本
@@ -105,14 +128,15 @@ export default function ExportPage() {
         <Button
           variant="contained"
           color="secondary"
+          disabled={blockedSessions.length > 0}
           onClick={() => {
             downloadText(`观测清单-${night?.date ?? 'night'}.csv`, csv, 'text/csv');
-            setNotice('已下载观测清单 CSV 文件');
+            setNotice('已下载观测清单 CSV 文件（已排除未处置冲突段）');
           }}
         >
           下载 CSV
         </Button>
-        <Button variant="outlined" onClick={() => printPage()}>
+        <Button variant="outlined" disabled={blockedSessions.length > 0} onClick={() => printPage()}>
           打印视图
         </Button>
       </Stack>
@@ -132,10 +156,10 @@ export default function ExportPage() {
         </Paper>
         <Paper variant="outlined" sx={{ p: 2 }}>
           <Typography variant="subtitle1" sx={{ mb: 1 }}>
-            排程段状态核对
+            排程段状态核对（可导出 {exportableSessions.length} 段）
           </Typography>
           <Stack spacing={1}>
-            {[...nightSessions]
+            {[...exportableSessions]
               .sort((a, b) => axisMinutes(a.startTime) - axisMinutes(b.startTime))
               .map((session) => {
                 const target = targets.find((item) => item.id === session.targetId);
@@ -146,13 +170,30 @@ export default function ExportPage() {
                     <Chip size="small" variant="outlined" label={session.filterSlot} />
                     <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧`} />
                     <StatusChip status={session.status} />
+                    <Chip size="small" color={PROVENANCE_COLOR[session.provenance ?? '初始计划']} variant={session.provenance === '初始计划' || session.provenance === '历史迁移' ? 'outlined' : 'filled'} label={session.provenance ?? '初始计划'} />
                   </Stack>
                 );
               })}
-            {nightSessions.length === 0 ? (
+            {exportableSessions.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
-                该观测夜暂无排程段
+                该观测夜暂无可导出排程段{blockedSessions.length > 0 ? '（全部等待冲突处置）' : ''}
               </Typography>
+            ) : null}
+            {blockedSessions.length > 0 ? (
+              <Paper variant="outlined" sx={{ p: 1, borderColor: 'error.main', mt: 1 }}>
+                <Typography variant="caption" color="error" sx={{ fontWeight: 600 }}>
+                  已排除（未人工处置）：
+                </Typography>
+                {blockedSessions.map((session) => {
+                  const target = targets.find((item) => item.id === session.targetId);
+                  return (
+                    <Stack key={session.id} direction="row" spacing={1} alignItems="center" sx={{ mt: 0.5 }}>
+                      <Chip size="small" color="error" label={session.id} />
+                      <Typography variant="caption">{target?.name ?? '未知目标'}</Typography>
+                    </Stack>
+                  );
+                })}
+              </Paper>
             ) : null}
           </Stack>
         </Paper>

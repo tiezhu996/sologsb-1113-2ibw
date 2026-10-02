@@ -1,12 +1,12 @@
 import Dexie, { type Table } from 'dexie';
 import { useEffect, useState } from 'react';
-import type { Instrument, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
+import type { Instrument, MergeConflict, ObsNight, ObsSession, ObsTarget, OfflineChange, SessionSnapshot, Telescope } from '../types';
 
 /** IndexedDB 库名（浏览器本地存储，无后端） */
 export const DB_NAME = 'gbobsplan-db';
 
 /** 当前数据结构版本，写入每条记录并用于升级迁移判定 */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 class ObsPlanDB extends Dexie {
   targets!: Table<ObsTarget, string>;
@@ -15,6 +15,12 @@ class ObsPlanDB extends Dexie {
   instruments!: Table<Instrument, string>;
   nights!: Table<ObsNight, string>;
   meta!: Table<{ key: string; value: string }, string>;
+  /** 最近一次同步 / 合并时的排程段共同基线（id 与 sessions 一致） */
+  syncBases!: Table<SessionSnapshot, string>;
+  /** 主控 / 现场两侧的离线草案 */
+  offlineChanges!: Table<OfflineChange, string>;
+  /** 合并冲突区（两边都改过的排程段，等人处置） */
+  mergeConflicts!: Table<MergeConflict, string>;
 
   constructor() {
     super(DB_NAME);
@@ -54,6 +60,40 @@ class ObsPlanDB extends Dexie {
               row.backupNightId = backupNight.id;
             }
           });
+      });
+
+    // v3：值班双窗口离线合并。新增 syncBases / offlineChanges / mergeConflicts；
+    // 旧版本排程段按历史计划迁移：写入共同基线并标记「历史迁移」，不产生新冲突
+    this.version(3)
+      .stores({
+        targets: 'id, name, catalog, type, priority, magnitude',
+        sessions: 'id, nightId, targetId, telescopeId, instrumentId, startTime, status, backupNightId, provenance',
+        telescopes: 'id, code, status',
+        instruments: 'id, model, telescopeCode, terminalType',
+        nights: 'id, date, siteName, primary, backup',
+        meta: 'key',
+        syncBases: 'id, nightId, status',
+        offlineChanges: '[side+sessionId], side, sessionId',
+        mergeConflicts: 'id, sessionId, status',
+      })
+      .upgrade(async (tx) => {
+        const sessions = (await tx.table('sessions').toArray()) as ObsSession[];
+        const migratedAt = new Date().toISOString();
+        const bases: SessionSnapshot[] = sessions.map((row) => {
+          const { __offlineSide, __offlineDeleted, ...snapshot } = row;
+          // 旧数据按历史计划迁移：打上来源标记，合并时只作共同基线、不算任一侧草案
+          const base: SessionSnapshot = {
+            ...snapshot,
+            schemaVersion: SCHEMA_VERSION,
+            provenance: '历史迁移',
+          };
+          Object.assign(row, { schemaVersion: SCHEMA_VERSION, provenance: '历史迁移' });
+          return base;
+        });
+        await tx.table('sessions').bulkPut(sessions);
+        await tx.table('syncBases').clear();
+        await tx.table('syncBases').bulkPut(bases);
+        await tx.table('meta').put({ key: 'v3MigratedAt', value: migratedAt });
       });
   }
 }
@@ -116,22 +156,23 @@ const SEED_INSTRUMENTS: Instrument[] = [
   { id: 'ins-004', model: 'Shelyak Lhires III', terminalType: '光谱仪', pixelSizeUm: 9, sensorWidthMm: 8, sensorHeightMm: 6, readNoiseE: 4, telescopeCode: 'T-03' },
 ];
 
-/** 含一处同望远镜时段冲突（s-03 与 s-04 在 T-02 上重叠）与一条因云取消已改期记录 */
+/** 含一处同望远镜时段冲突（s-03 与 s-04 在 T-02 上重叠）与一条因云取消已改期记录；
+ *  s-01 / s-02 / s-09 已由现场登记执行事实 */
 const SEED_SESSIONS: ObsSession[] = [
-  { id: 's-01', nightId: 'night-001', targetId: 'target-001', startTime: '18:20', endTime: '19:20', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION },
-  { id: 's-02', nightId: 'night-001', targetId: 'target-002', startTime: '19:30', endTime: '20:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 45, status: '已完成', schemaVersion: SCHEMA_VERSION },
-  { id: 's-03', nightId: 'night-001', targetId: 'target-004', startTime: '20:40', endTime: '22:10', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-04', nightId: 'night-001', targetId: 'target-007', startTime: '21:30', endTime: '23:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 35, status: '待执行', schemaVersion: SCHEMA_VERSION, rescheduleReason: '与窄带目标争用 T-02，待改期' },
-  { id: 's-05', nightId: 'night-001', targetId: 'target-009', startTime: '23:10', endTime: '00:20', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'OIII', plannedFrames: 28, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-06', nightId: 'night-001', targetId: 'target-008', startTime: '00:30', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-07', nightId: 'night-001', targetId: 'target-011', startTime: '02:10', endTime: '03:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 120, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-08', nightId: 'night-001', targetId: 'target-010', startTime: '03:10', endTime: '04:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: '无滤镜', plannedFrames: 300, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-09', nightId: 'night-002', targetId: 'target-003', startTime: '18:30', endTime: '19:40', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION },
-  { id: 's-10', nightId: 'night-002', targetId: 'target-005', startTime: '19:50', endTime: '21:40', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 50, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-11', nightId: 'night-002', targetId: 'target-004', startTime: '21:50', endTime: '23:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '因云取消', schemaVersion: SCHEMA_VERSION, rescheduleReason: '夜间云量转多云，目标被云遮挡，改期至备用夜', backupNightId: 'night-003' },
-  { id: 's-12', nightId: 'night-002', targetId: 'target-012', startTime: '23:40', endTime: '01:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'SII', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION, rescheduleReason: '目标地平高度偏低，视情况顺延' },
-  { id: 's-13', nightId: 'night-002', targetId: 'target-010', startTime: '01:10', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 240, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-14', nightId: 'night-002', targetId: 'target-001', startTime: '02:10', endTime: '03:10', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
+  { id: 's-01', nightId: 'night-001', targetId: 'target-001', startTime: '18:20', endTime: '19:20', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION, provenance: '现场执行', actualStartTime: '18:22', actualEndTime: '19:18', actualFrames: 42, recordedBy: '现场值班', recordedAt: '2025-10-11T19:20:00+08:00', executionNote: '透明度良好，追加 2 帧' },
+  { id: 's-02', nightId: 'night-001', targetId: 'target-002', startTime: '19:30', endTime: '20:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 45, status: '已完成', schemaVersion: SCHEMA_VERSION, provenance: '现场执行', actualStartTime: '19:31', actualEndTime: '20:29', actualFrames: 45, recordedBy: '现场值班', recordedAt: '2025-10-11T20:30:00+08:00' },
+  { id: 's-03', nightId: 'night-001', targetId: 'target-004', startTime: '20:40', endTime: '22:10', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划' },
+  { id: 's-04', nightId: 'night-001', targetId: 'target-007', startTime: '21:30', endTime: '23:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 35, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划', rescheduleReason: '与窄带目标争用 T-02，待改期' },
+  { id: 's-05', nightId: 'night-001', targetId: 'target-009', startTime: '23:10', endTime: '00:20', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'OIII', plannedFrames: 28, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划' },
+  { id: 's-06', nightId: 'night-001', targetId: 'target-008', startTime: '00:30', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划' },
+  { id: 's-07', nightId: 'night-001', targetId: 'target-011', startTime: '02:10', endTime: '03:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 120, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划' },
+  { id: 's-08', nightId: 'night-001', targetId: 'target-010', startTime: '03:10', endTime: '04:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: '无滤镜', plannedFrames: 300, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划' },
+  { id: 's-09', nightId: 'night-002', targetId: 'target-003', startTime: '18:30', endTime: '19:40', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 40, status: '进行中', schemaVersion: SCHEMA_VERSION, provenance: '现场执行', actualStartTime: '18:35', actualFrames: 22, recordedBy: '现场值班', recordedAt: '2025-10-12T19:05:00+08:00' },
+  { id: 's-10', nightId: 'night-002', targetId: 'target-005', startTime: '19:50', endTime: '21:40', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 50, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划' },
+  { id: 's-11', nightId: 'night-002', targetId: 'target-004', startTime: '21:50', endTime: '23:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '因云取消', schemaVersion: SCHEMA_VERSION, provenance: '初始计划', rescheduleReason: '夜间云量转多云，目标被云遮挡，改期至备用夜', backupNightId: 'night-003' },
+  { id: 's-12', nightId: 'night-002', targetId: 'target-012', startTime: '23:40', endTime: '01:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'SII', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划', rescheduleReason: '目标地平高度偏低，视情况顺延' },
+  { id: 's-13', nightId: 'night-002', targetId: 'target-010', startTime: '01:10', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 240, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划' },
+  { id: 's-14', nightId: 'night-002', targetId: 'target-001', startTime: '02:10', endTime: '03:10', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION, provenance: '初始计划' },
 ];
 
 /** 首次打开（表内无数据）时写入示例数据 */
@@ -145,7 +186,7 @@ export async function seedIfEmpty(): Promise<void> {
     db.instruments.count(),
     db.nights.count(),
   ]);
-  // Dexie 的 transaction 最多接受 5 张表 + 作用域，因此 meta 标记在事务外写入
+  // Dexie 单事务最多 5 张业务表：基线随排程段一起入库需 6 张，因此 syncBases 单独写
   await db.transaction('rw', db.targets, db.sessions, db.telescopes, db.instruments, db.nights, async () => {
     if (targetCount === 0) await db.targets.bulkPut(SEED_TARGETS);
     if (nightCount === 0) await db.nights.bulkPut(SEED_NIGHTS);
@@ -153,23 +194,35 @@ export async function seedIfEmpty(): Promise<void> {
     if (instrumentCount === 0) await db.instruments.bulkPut(SEED_INSTRUMENTS);
     if (sessionCount === 0) await db.sessions.bulkPut(SEED_SESSIONS);
   });
+  if (sessionCount === 0 && (await db.syncBases.count()) === 0) {
+    await db.syncBases.bulkPut(SEED_SESSIONS.map(stripTransient));
+  }
   await db.meta.put({ key: 'seeded', value: new Date().toISOString() });
+}
+
+/** 去掉仅内存使用的离线草案标记，得到可入库的排程段 / 基线快照 */
+export function stripTransient(session: ObsSession): SessionSnapshot {
+  const { __offlineSide, __offlineDeleted, ...snapshot } = session;
+  return snapshot;
 }
 
 /** 把 Dexie 数据同步到各 Zustand store（动态 import 规避模块循环依赖） */
 export async function hydrateAllStores(): Promise<void> {
-  const [{ useTargetStore }, { useSessionStore }, { useEquipmentStore }, { useNightStore }] = await Promise.all([
+  const [{ useTargetStore }, { useSessionStore }, { useEquipmentStore }, { useNightStore }, { useSyncStore }] = await Promise.all([
     import('../stores/targetStore'),
     import('../stores/sessionStore'),
     import('../stores/equipmentStore'),
     import('../stores/nightStore'),
+    import('../stores/syncStore'),
   ]);
   await Promise.all([
     useTargetStore.getState().hydrate(),
-    useSessionStore.getState().hydrate(),
     useEquipmentStore.getState().hydrate(),
     useNightStore.getState().hydrate(),
   ]);
+  // syncStore 先装载：排程段的 hydrate 依赖当前角色 / 在线状态决定是否注入本侧离线草案
+  await useSyncStore.getState().hydrate();
+  await useSessionStore.getState().hydrate();
 }
 
 let bootstrap: Promise<void> | null = null;

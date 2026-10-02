@@ -24,7 +24,7 @@ export function buildNightPlanText(context: PlanContext): string {
     }　云量预报：${night?.cloudText ?? '-'}`,
   );
   lines.push('-'.repeat(96));
-  lines.push('序 时段           目标            望远镜   终端            滤镜  帧数  状态      备注');
+  lines.push('序 时段           目标            望远镜   终端            滤镜  帧数  状态      来源      备注');
   const ordered = [...sessions].sort((a, b) => a.startTime.localeCompare(b.startTime));
   ordered.forEach((session, index) => {
     const target = targets.find((item) => item.id === session.targetId);
@@ -40,8 +40,10 @@ export function buildNightPlanText(context: PlanContext): string {
         session.filterSlot.padEnd(6, ' '),
         pad(session.plannedFrames, 4),
         session.status.padEnd(8, ' '),
+        (session.provenance ?? '初始计划').padEnd(8, ' '),
         session.rescheduleReason ?? '',
-      ].join(' '),
+        session.actualFrames !== undefined ? `实拍 ${session.actualFrames} 帧${session.executionNote ? `（${session.executionNote}）` : ''}` : '',
+      ].filter((part) => part !== '').join(' '),
     );
   });
   lines.push('-'.repeat(96));
@@ -58,7 +60,7 @@ export function buildNightPlanText(context: PlanContext): string {
 /** 生成 CSV */
 export function buildPlanCsv(context: PlanContext): string {
   const { sessions, targets, telescopes, instruments } = context;
-  const header = ['观测夜', '时段', '目标名', '星表编号', '类型', '视星等', '望远镜', '终端', '滤镜', '帧数', '单帧曝光(s)', '状态', '改期原因'];
+  const header = ['观测夜', '时段', '目标名', '星表编号', '类型', '视星等', '望远镜', '终端', '滤镜', '帧数', '单帧曝光(s)', '状态', '来源', '改期原因', '实际帧数', '实际开始', '实际结束', '执行备注'];
   const rows = [...sessions]
     .sort((a, b) => a.startTime.localeCompare(b.startTime))
     .map((session) => {
@@ -78,7 +80,12 @@ export function buildPlanCsv(context: PlanContext): string {
         String(session.plannedFrames),
         target ? String(target.exposureSec) : '',
         session.status,
+        session.provenance ?? '初始计划',
         session.rescheduleReason ?? '',
+        session.actualFrames !== undefined ? String(session.actualFrames) : '',
+        session.actualStartTime ?? '',
+        session.actualEndTime ?? '',
+        session.executionNote ?? '',
       ];
     });
   const csv = [header, ...rows]
